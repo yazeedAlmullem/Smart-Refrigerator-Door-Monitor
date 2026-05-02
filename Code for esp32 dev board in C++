@@ -1,0 +1,290 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+
+#define WIFI_SSID "ur Wifi "
+#define WIFI_PASSWORD "Wifi password"
+#define BOT_TOKEN "Bot token on telegram"
+#define CHAT_ID "CHat id between you and the bot"
+
+WiFiClientSecure secureClient;
+
+// ========== Pins (ESP32) ==========
+#define outputA 23  // CLK
+#define outputB 25  // DT
+#define SW_PIN   26  // Manual close button
+#define LED_PIN  2   // Onboard LED (warning)
+
+int doorPosition = 0;
+int lastPrintedPosition = -1;
+int aState, aLastState;
+
+int maxPosition = 0;
+unsigned long maxPositionTime = 0;
+unsigned long openStartTime = 0;
+bool doorWasOpen = false;
+
+const unsigned long WARNING_DELAY = 30000;   // 30 seconds
+bool warningSent = false;                    // only one warning per opening
+unsigned long lastFlashTime = 0;
+bool ledState = false;
+
+unsigned long lastButtonTime = 0;
+const unsigned long debounceDelay = 200;
+
+// ========== Speed thresholds ==========
+const float FATHER_MIN = 3.67;
+const float YOU_MIN    = 2.34;
+const float YOU_MAX    = 3.67;
+const float MOM_MIN    = 1.00;
+const float MOM_MAX    = 2.33;
+
+// ========== URL encode helper ==========
+String urlEncode(String str) {
+  String encoded = "";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if (c == ' ') encoded += "%20";
+    else if (c == '\n') encoded += "%0A";
+    else if (c == '!') encoded += "%21";
+    else if (c == '#') encoded += "%23";
+    else if (c == '$') encoded += "%24";
+    else if (c == '%') encoded += "%25";
+    else if (c == '&') encoded += "%26";
+    else if (c == '\'') encoded += "%27";
+    else if (c == '(') encoded += "%28";
+    else if (c == ')') encoded += "%29";
+    else if (c == '*') encoded += "%2A";
+    else if (c == '+') encoded += "%2B";
+    else if (c == ',') encoded += "%2C";
+    else if (c == '/') encoded += "%2F";
+    else if (c == ':') encoded += "%3A";
+    else if (c == ';') encoded += "%3B";
+    else if (c == '=') encoded += "%3D";
+    else if (c == '?') encoded += "%3F";
+    else if (c == '@') encoded += "%40";
+    else if (c == '[') encoded += "%5B";
+    else if (c == '\\') encoded += "%5C";
+    else if (c == ']') encoded += "%5D";
+    else if (c == '^') encoded += "%5E";
+    else if (c == '_') encoded += "%5F";
+    else if (c == '`') encoded += "%60";
+    else if (c == '{') encoded += "%7B";
+    else if (c == '|') encoded += "%7C";
+    else if (c == '}') encoded += "%7D";
+    else if (c == '~') encoded += "%7E";
+    else encoded += c;
+  }
+  return encoded;
+}
+
+// ========== sendTelegram (clean output, no headers) ==========
+void sendTelegram(String message) {
+  String encodedMessage = urlEncode(message);
+  String url = "/bot" + String(BOT_TOKEN) + "/sendMessage?chat_id=" + String(CHAT_ID) + "&text=" + encodedMessage;
+
+  secureClient.setInsecure();
+  if (!secureClient.connect("api.telegram.org", 443)) {
+    Serial.println("Telegram connection failed");
+    return;
+  }
+
+  secureClient.println("GET " + url + " HTTP/1.1");
+  secureClient.println("Host: api.telegram.org");
+  secureClient.println("Connection: close");
+  secureClient.println();
+
+  unsigned long timeout = millis();
+  while (secureClient.available() == 0) {
+    if (millis() - timeout > 5000) {
+      Serial.println("Telegram timeout");
+      secureClient.stop();
+      return;
+    }
+  }
+
+  // Skip HTTP headers
+  while (secureClient.available()) {
+    String line = secureClient.readStringUntil('\n');
+    if (line == "\r" || line.length() <= 1) break; // empty line marks end of headers
+  }
+
+  // Read JSON body and print only that
+  String responseBody = "";
+  while (secureClient.available()) {
+    responseBody = secureClient.readStringUntil('\n');
+    Serial.println(responseBody);      // print the JSON body only
+  }
+  secureClient.stop();
+}
+
+// ========== Warning message to Telegram ==========
+void sendWarning() {
+  if (!warningSent) {
+    warningSent = true;
+    sendTelegram("⚠️ WARNING: Fridge door has been open for over 30 seconds!");
+    Serial.println("⚠️ WARNING: Fridge open >30s – sent alert");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected.");
+
+  sendTelegram("🚪 Fridge Monitor started");
+
+  pinMode(outputA, INPUT);
+  pinMode(outputB, INPUT);
+  pinMode(SW_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  Serial.println("Fridge Door Monitor (final)");
+  Serial.print("Door Position: ");
+  Serial.println(doorPosition);
+  lastPrintedPosition = doorPosition;
+  aLastState = digitalRead(outputA);
+}
+
+void loop() {
+  // --- Manual close button ---
+  if (digitalRead(SW_PIN) == LOW) {
+    unsigned long now = millis();
+    if (now - lastButtonTime >= debounceDelay) {
+      lastButtonTime = now;
+      if (doorPosition != 0) {
+        Serial.println("Button pressed – closing fridge manually.");
+        doorPosition = 0;
+        lastPrintedPosition = -1;
+        digitalWrite(LED_PIN, LOW);
+        ledState = false;
+      }
+    }
+  }
+
+  // --- Rotary encoder (polling, falling edge) ---
+  aState = digitalRead(outputA);
+  if (aState == LOW && aLastState == HIGH) {
+    if (digitalRead(outputB) == HIGH) {
+      if (doorPosition < 9) doorPosition++;
+    } else {
+      if (doorPosition > 0) doorPosition--;
+    }
+
+    if (doorPosition > maxPosition) {
+      maxPosition = doorPosition;
+      maxPositionTime = millis();
+    }
+
+    if (doorPosition != lastPrintedPosition) {
+      Serial.print("Door Position: ");
+      Serial.println(doorPosition);
+      lastPrintedPosition = doorPosition;
+    }
+  }
+  aLastState = aState;
+
+  // --- Open / close detection ---
+  bool doorIsOpen = (doorPosition > 0);
+
+  if (doorIsOpen && !doorWasOpen) {
+    // Just opened – reset session
+    openStartTime = millis();
+    maxPosition = 0;
+    maxPositionTime = 0;
+    warningSent = false;          // allow a new warning for this session
+  }
+  else if (!doorIsOpen && doorWasOpen) {
+    // ---- FRIDGE CLOSED ----
+    unsigned long totalOpenMs = millis() - openStartTime;
+    float totalOpenSec = totalOpenMs / 1000.0;
+
+    Serial.println("--- Fridge Closed ---");
+
+    String message = "🚪 Fridge Closed\n";
+    message += "⏱ Open for " + String(totalOpenSec, 1) + " seconds\n";
+    Serial.print("⏱ Open for ");
+    Serial.print(totalOpenSec, 1);
+    Serial.println(" sec");
+
+    // How far
+    if (maxPosition == 0) {
+      message += "Opened briefly (no movement).";
+      Serial.println("Opened briefly (no movement).");
+    } else if (maxPosition <= 3) {
+      message += "📏 Quarter open – front grab.";
+      Serial.println("Opened a quarter: quick grab from the front.");
+    } else if (maxPosition <= 6) {
+      message += "📏 Half open – middle shelf.";
+      Serial.println("Opened half way: middle shelf access.");
+    } else {
+      message += "📏 Fully open – back of fridge.";
+      Serial.println("Opened fully: back of the fridge reached.");
+    }
+
+    // Who
+    if (maxPosition > 0 && openStartTime > 0 && maxPositionTime > openStartTime) {
+      unsigned long durationToMax = maxPositionTime - openStartTime;
+      float speed = (float)maxPosition * 1000.0 / durationToMax;
+
+      Serial.print("Max opening: ");
+      Serial.print(maxPosition);
+      Serial.print(" positions in ");
+      Serial.print(durationToMax);
+      Serial.print(" ms | Speed: ");
+      Serial.print(speed);
+      Serial.println(" pos/s");
+
+      message += "\n";
+      if (speed > FATHER_MIN) {
+        message += "👨 Father (fast)";
+        Serial.println("→ Father");
+      } else if (speed >= YOU_MIN && speed <= YOU_MAX) {
+        message += "🧑 You (medium)";
+        Serial.println("→ You");
+      } else if (speed >= MOM_MIN && speed <= MOM_MAX) {
+        message += "👩 Mom (slow)";
+        Serial.println("→ Mom");
+      } else {
+        message += "👶 Kid (very slow)";
+        Serial.print("→ Kid (");
+        Serial.print(durationToMax);
+        Serial.println(" ms)");
+      }
+    } else {
+      message += "\nCould not determine person.";
+      Serial.println("Could not determine person.");
+    }
+
+    Serial.println(message);
+    sendTelegram(message);
+
+    // Reset
+    digitalWrite(LED_PIN, LOW);
+    ledState = false;
+    maxPosition = 0;
+    warningSent = false;
+  }
+
+  // --- Warning LED (flashes after 30 s) + Telegram warning ---
+  if (doorIsOpen && (millis() - openStartTime >= WARNING_DELAY)) {
+    // Blink LED
+    if (millis() - lastFlashTime >= 500) {
+      ledState = !ledState;
+      digitalWrite(LED_PIN, ledState);
+      lastFlashTime = millis();
+    }
+    // Send warning once
+    sendWarning();
+  }
+
+  doorWasOpen = doorIsOpen;
+  delay(1);
+}
